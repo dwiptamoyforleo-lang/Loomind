@@ -1,6 +1,6 @@
 {
   "name": "Loomind",
-  "description": "Visual thought weaving and mind mapping canvas for organizing ideas, notes, and connections.",
+  "description": "Intelligent AI research and study workspace with grounded multi-source synthesis, study guides, and audio overviews.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

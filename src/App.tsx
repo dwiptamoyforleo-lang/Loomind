@@ -1,515 +1,517 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { LoomindData, ThoughtNode, WeaveConnection, CanvasViewport, CanvasMode } from './types';
-import { INITIAL_DATA } from './data/initialData';
-import { applyAutoLayout, buildChildrenMap } from './utils/layout';
-import { Toolbar } from './components/Toolbar';
-import { Canvas } from './components/Canvas';
-import { NodeDrawer } from './components/NodeDrawer';
-import { Minimap } from './components/Minimap';
-import { TemplatesModal } from './components/TemplatesModal';
-import { ExportModal } from './components/ExportModal';
-import { Sparkles, Command, HelpCircle } from 'lucide-react';
-
-const STORAGE_KEY = 'loomind_mindmap_v1';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Notebook,
+  ResearchSource,
+  ChatMessage,
+  StudioSavedItem,
+  UserProfile,
+  ThemeMode,
+  ActiveWorkspaceTab,
+} from './types';
+import { DEFAULT_USERS } from './data/seedData';
+import {
+  getSavedCurrentUserId,
+  saveCurrentUserId,
+  loadUserWorkspace,
+  saveUserWorkspace,
+  clearUserData,
+} from './utils/storage';
+import { sendChatMessage, checkServerConfig } from './utils/api';
+import { Sidebar } from './components/layout/Sidebar';
+import { MobileNav } from './components/layout/MobileNav';
+import { HomeScreen } from './components/dashboard/HomeScreen';
+import { NotebookHeader } from './components/notebook/NotebookHeader';
+import { SourcesPanel } from './components/sources/SourcesPanel';
+import { ChatWorkspace } from './components/chat/ChatWorkspace';
+import { StudioPanel } from './components/studio/StudioPanel';
+import { AddSourceModal } from './components/sources/AddSourceModal';
+import { SourceReaderModal } from './components/sources/SourceReaderModal';
+import { GlobalSearchModal } from './components/search/GlobalSearchModal';
+import { UserProfileModal } from './components/modals/UserProfileModal';
+import { NewNotebookModal } from './components/modals/NewNotebookModal';
+import { ShareExportModal } from './components/modals/ShareExportModal';
 
 export const App: React.FC = () => {
-  // Load initial data from localStorage if available
-  const [data, setData] = useState<LoomindData>(() => {
+  // 1. User & Authentication Isolation
+  const [currentUserId, setCurrentUserId] = useState<string>(getSavedCurrentUserId);
+  const currentUser = DEFAULT_USERS.find((u) => u.id === currentUserId) || DEFAULT_USERS[0];
+
+  // User-scoped persistent state
+  const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+  const [sources, setSources] = useState<ResearchSource[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [savedItems, setSavedItems] = useState<StudioSavedItem[]>([]);
+
+  // 2. Active Selection & Navigation
+  const [activeNotebookId, setActiveNotebookId] = useState<string | null>(null);
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<ActiveWorkspaceTab>('chat');
+  const [filterMode, setFilterMode] = useState<'all' | 'recent' | 'starred' | 'archive'>('all');
+
+  // 3. Theme Mode
+  const [theme, setTheme] = useState<ThemeMode>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed.nodes && parsed.rootId && parsed.nodes[parsed.rootId]) {
-          return parsed;
-        }
-      }
+      const saved = localStorage.getItem('noesis_theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     } catch {
-      // Fall back to default
+      return 'dark';
     }
-    return INITIAL_DATA;
   });
 
-  // Undo / Redo history
-  const [historyPast, setHistoryPast] = useState<LoomindData[]>([]);
-  const [historyFuture, setHistoryFuture] = useState<LoomindData[]>([]);
-
-  // Viewport
-  const [viewport, setViewport] = useState<CanvasViewport>({
-    x: window.innerWidth / 2,
-    y: window.innerHeight / 2,
-    zoom: 1,
-  });
-
-  // UI state
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [mode, setMode] = useState<CanvasMode>('select');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [isTemplatesOpen, setIsTemplatesOpen] = useState(false);
-  const [isExportOpen, setIsExportOpen] = useState(false);
-  const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
-
-  // Auto-save to localStorage
+  // Apply dark mode class to root HTML
   useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      localStorage.setItem('noesis_theme', theme);
     } catch (e) {
-      console.warn('Failed to save to localStorage:', e);
+      console.warn('Failed to save theme setting:', e);
     }
-  }, [data]);
+  }, [theme]);
 
-  // Push state to undo history
-  const pushHistory = useCallback(
-    (newData: LoomindData) => {
-      setHistoryPast((past) => [...past.slice(-25), data]);
-      setHistoryFuture([]);
-      setData(newData);
-    },
-    [data]
-  );
-
-  const handleUndo = useCallback(() => {
-    if (historyPast.length === 0) return;
-    const previous = historyPast[historyPast.length - 1];
-    setHistoryPast((past) => past.slice(0, -1));
-    setHistoryFuture((future) => [data, ...future]);
-    setData(previous);
-  }, [historyPast, data]);
-
-  const handleRedo = useCallback(() => {
-    if (historyFuture.length === 0) return;
-    const next = historyFuture[0];
-    setHistoryFuture((future) => future.slice(1));
-    setHistoryPast((past) => [...past, data]);
-    setData(next);
-  }, [historyFuture, data]);
-
-  // Search matches
-  const searchResultsCount = React.useMemo(() => {
-    if (!searchQuery.trim()) return 0;
-    const q = searchQuery.toLowerCase();
-    return Object.values(data.nodes).filter(
-      (n) =>
-        n.title.toLowerCase().includes(q) ||
-        (n.notes && n.notes.toLowerCase().includes(q)) ||
-        (n.tags && n.tags.some((t) => t.toLowerCase().includes(q)))
-    ).length;
-  }, [data.nodes, searchQuery]);
-
-  // Center / fit to view
-  const handleResetView = () => {
-    setViewport({
-      x: window.innerWidth / 2,
-      y: window.innerHeight / 2,
-      zoom: 1,
-    });
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   };
 
-  const handleFitView = () => {
-    const nodeList = Object.values(data.nodes);
-    if (nodeList.length === 0) return;
+  // 4. Modals State
+  const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
+  const [previewingSource, setPreviewingSource] = useState<ResearchSource | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isNewNotebookOpen, setIsNewNotebookOpen] = useState(false);
+  const [isExportOpen, setIsExportOpen] = useState(false);
 
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
+  // 5. Chat Loading & AI Config
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [geminiConfigured, setGeminiConfigured] = useState(false);
 
-    for (const n of nodeList) {
-      if (n.x < minX) minX = n.x;
-      if (n.x > maxX) maxX = n.x;
-      if (n.y < minY) minY = n.y;
-      if (n.y > maxY) maxY = n.y;
+  // Load user data on startup or when switching accounts
+  useEffect(() => {
+    saveCurrentUserId(currentUserId);
+    const loaded = loadUserWorkspace(currentUserId);
+    setNotebooks(loaded.notebooks);
+    setSources(loaded.sources);
+    setMessages(loaded.messages);
+    setSavedItems(loaded.savedItems);
+    setActiveNotebookId(loaded.notebooks[0]?.id || null);
+  }, [currentUserId]);
+
+  // Persist user data whenever workspace changes
+  useEffect(() => {
+    if (notebooks.length > 0 || sources.length > 0) {
+      saveUserWorkspace(currentUserId, {
+        notebooks,
+        sources,
+        messages,
+        savedItems,
+      });
     }
+  }, [notebooks, sources, messages, savedItems, currentUserId]);
 
-    const width = Math.max(maxX - minX + 400, 400);
-    const height = Math.max(maxY - minY + 300, 300);
-
-    const zoomX = window.innerWidth / width;
-    const zoomY = (window.innerHeight - 56) / height;
-    const newZoom = Math.min(Math.max(Math.min(zoomX, zoomY) * 0.85, 0.4), 1.3);
-
-    const centerX = (minX + maxX) / 2;
-    const centerY = (minY + maxY) / 2;
-
-    setViewport({
-      x: window.innerWidth / 2 - centerX * newZoom,
-      y: (window.innerHeight + 56) / 2 - centerY * newZoom,
-      zoom: newZoom,
+  // Check server config
+  useEffect(() => {
+    checkServerConfig().then((cfg) => {
+      setGeminiConfigured(cfg.geminiConfigured);
     });
-  };
+  }, []);
 
-  // Node operations
-  const handleAddChild = (parentId: string) => {
-    const parent = data.nodes[parentId];
-    if (!parent) return;
-
-    const newId = `node_${Date.now()}`;
-    const childrenMap = buildChildrenMap(data.nodes);
-    const siblings = childrenMap[parentId] || [];
-
-    // Direction based on parent placement relative to root
-    const isRight = parent.x >= 0;
-    const xOffset = isRight ? 260 : -260;
-    const yOffset = (siblings.length - 1) * 70;
-
-    const childNode: ThoughtNode = {
-      id: newId,
-      title: 'New Thought',
-      parentId,
-      x: parent.x + xOffset,
-      y: parent.y + yOffset,
-      color: parent.color,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    pushHistory({
-      ...data,
-      nodes: {
-        ...data.nodes,
-        [parentId]: { ...parent, isCollapsed: false },
-        [newId]: childNode,
-      },
-      updatedAt: Date.now(),
-    });
-
-    setSelectedNodeId(newId);
-  };
-
-  const handleAddSibling = (siblingId: string) => {
-    const sibling = data.nodes[siblingId];
-    if (!sibling || !sibling.parentId) return;
-
-    const newId = `node_${Date.now()}`;
-    const newNode: ThoughtNode = {
-      id: newId,
-      title: 'New Sibling',
-      parentId: sibling.parentId,
-      x: sibling.x,
-      y: sibling.y + 80,
-      color: sibling.color,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    pushHistory({
-      ...data,
-      nodes: {
-        ...data.nodes,
-        [newId]: newNode,
-      },
-      updatedAt: Date.now(),
-    });
-
-    setSelectedNodeId(newId);
-  };
-
-  const handleDeleteNode = (id: string) => {
-    if (id === data.rootId) return; // cannot delete root
-
-    const childrenMap = buildChildrenMap(data.nodes);
-    const idsToDelete = new Set<string>();
-
-    const collectDescendants = (nodeId: string) => {
-      idsToDelete.add(nodeId);
-      const children = childrenMap[nodeId] || [];
-      for (const childId of children) {
-        collectDescendants(childId);
+  // Keyboard shortcut for Search (Cmd+K / Ctrl+K)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsSearchOpen((prev) => !prev);
       }
     };
-    collectDescendants(id);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
-    const remainingNodes = { ...data.nodes };
-    for (const dId of idsToDelete) {
-      delete remainingNodes[dId];
-    }
+  // Account switching with strict data isolation
+  const handleSwitchUser = (newUserId: string) => {
+    setCurrentUserId(newUserId);
+  };
 
-    // Filter out weaves connected to deleted nodes
-    const remainingWeaves = data.weaves.filter(
-      (w) => !idsToDelete.has(w.fromId) && !idsToDelete.has(w.toId)
+  const handleClearUserData = () => {
+    clearUserData(currentUserId);
+    const fresh = loadUserWorkspace(currentUserId);
+    setNotebooks(fresh.notebooks);
+    setSources(fresh.sources);
+    setMessages(fresh.messages);
+    setSavedItems(fresh.savedItems);
+    setActiveNotebookId(fresh.notebooks[0]?.id || null);
+  };
+
+  // Notebook Actions
+  const activeNotebook = notebooks.find((n) => n.id === activeNotebookId) || null;
+  const notebookSources = sources.filter((s) => s.notebookId === activeNotebookId);
+  const notebookMessages = messages.filter(
+    (m) =>
+      m.conversationId === `conv_${activeNotebookId}` ||
+      (m.conversationId.startsWith('conv_') && activeNotebookId?.includes('clara'))
+  );
+  const notebookSavedItems = savedItems.filter((item) => item.notebookId === activeNotebookId);
+
+  const handleCreateNotebook = (newNb: Omit<Notebook, 'id' | 'createdAt' | 'updatedAt'>) => {
+    const created: Notebook = {
+      ...newNb,
+      id: `nb_${Date.now()}`,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setNotebooks((prev) => [created, ...prev]);
+    setActiveNotebookId(created.id);
+  };
+
+  const handleUpdateNotebook = (updates: Partial<Notebook>) => {
+    if (!activeNotebookId) return;
+    setNotebooks((prev) =>
+      prev.map((nb) => (nb.id === activeNotebookId ? { ...nb, ...updates } : nb))
     );
-
-    pushHistory({
-      ...data,
-      nodes: remainingNodes,
-      weaves: remainingWeaves,
-      updatedAt: Date.now(),
-    });
-
-    if (selectedNodeId && idsToDelete.has(selectedNodeId)) {
-      setSelectedNodeId(null);
-      setIsDrawerOpen(false);
-    }
   };
 
-  const handleUpdateNodeTitle = (id: string, newTitle: string) => {
-    const node = data.nodes[id];
-    if (!node || node.title === newTitle) return;
-
-    pushHistory({
-      ...data,
-      nodes: {
-        ...data.nodes,
-        [id]: { ...node, title: newTitle, updatedAt: Date.now() },
-      },
-      updatedAt: Date.now(),
-    });
-  };
-
-  const handleToggleCollapse = (id: string) => {
-    const node = data.nodes[id];
-    if (!node) return;
-
-    setData((prev) => ({
-      ...prev,
-      nodes: {
-        ...prev.nodes,
-        [id]: { ...node, isCollapsed: !node.isCollapsed },
-      },
-    }));
-  };
-
-  const handleMoveNode = (id: string, x: number, y: number) => {
-    setData((prev) => {
-      const node = prev.nodes[id];
-      if (!node) return prev;
-      return {
-        ...prev,
-        nodes: {
-          ...prev.nodes,
-          [id]: { ...node, x, y },
-        },
-      };
-    });
-  };
-
-  const handleAutoLayout = () => {
-    const reordered = applyAutoLayout(data.nodes, data.rootId);
-    pushHistory({
-      ...data,
-      nodes: reordered,
-      updatedAt: Date.now(),
-    });
-  };
-
-  // Weave connections
-  const handleCreateWeave = (fromId: string, toId: string) => {
-    if (fromId === toId) return;
-    // Check if weave already exists
-    const exists = data.weaves.some(
-      (w) =>
-        (w.fromId === fromId && w.toId === toId) || (w.fromId === toId && w.toId === fromId)
+  const handleToggleFavorite = (id: string) => {
+    setNotebooks((prev) =>
+      prev.map((nb) => (nb.id === id ? { ...nb, isFavorite: !nb.isFavorite } : nb))
     );
-    if (exists) return;
+  };
 
-    const newWeave: WeaveConnection = {
-      id: `w_${Date.now()}`,
-      fromId,
-      toId,
-      label: 'relates to',
-      style: 'curved',
+  const handleArchiveNotebook = (id: string) => {
+    setNotebooks((prev) =>
+      prev.map((nb) => (nb.id === id ? { ...nb, isArchived: !nb.isArchived } : nb))
+    );
+  };
+
+  const handleDeletePermanently = (id: string) => {
+    setNotebooks((prev) => prev.filter((nb) => nb.id !== id));
+    setSources((prev) => prev.filter((s) => s.notebookId !== id));
+    setSavedItems((prev) => prev.filter((item) => item.notebookId !== id));
+    if (activeNotebookId === id) setActiveNotebookId(null);
+  };
+
+  // Source Actions
+  const handleAddSource = (src: Omit<ResearchSource, 'id' | 'citationIndex'>) => {
+    const existingCount = sources.filter((s) => s.notebookId === src.notebookId).length;
+    const newSource: ResearchSource = {
+      ...src,
+      id: `src_${Date.now()}`,
+      citationIndex: existingCount + 1,
+    };
+    setSources((prev) => [...prev, newSource]);
+    // update notebook modified timestamp
+    setNotebooks((prev) =>
+      prev.map((nb) => (nb.id === src.notebookId ? { ...nb, updatedAt: Date.now() } : nb))
+    );
+  };
+
+  const handleToggleSourceSelect = (id: string) => {
+    setSources((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, isSelected: !s.isSelected } : s))
+    );
+  };
+
+  const handleToggleSelectAll = () => {
+    if (!activeNotebookId) return;
+    const currentActiveSources = sources.filter((s) => s.notebookId === activeNotebookId);
+    const allSelected = currentActiveSources.every((s) => s.isSelected);
+    setSources((prev) =>
+      prev.map((s) =>
+        s.notebookId === activeNotebookId ? { ...s, isSelected: !allSelected } : s
+      )
+    );
+  };
+
+  const handleDeleteSource = (id: string) => {
+    setSources((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  const handleRenameSource = (id: string, newTitle: string) => {
+    setSources((prev) => prev.map((s) => (s.id === id ? { ...s, title: newTitle } : s)));
+  };
+
+  // Chat Actions
+  const handleSendMessage = async (text: string) => {
+    if (!activeNotebook) return;
+
+    const userMsg: ChatMessage = {
+      id: `msg_u_${Date.now()}`,
+      conversationId: `conv_${activeNotebook.id}`,
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
     };
 
-    pushHistory({
-      ...data,
-      weaves: [...data.weaves, newWeave],
-      updatedAt: Date.now(),
-    });
+    setMessages((prev) => [...prev, userMsg]);
+    setIsChatLoading(true);
+
+    try {
+      const history = notebookMessages.map((m) => ({ role: m.role, content: m.content }));
+      const response = await sendChatMessage(
+        text,
+        notebookSources,
+        activeNotebook.title,
+        history
+      );
+
+      const assistantMsg: ChatMessage = {
+        id: `msg_a_${Date.now()}`,
+        conversationId: `conv_${activeNotebook.id}`,
+        role: 'assistant',
+        content: response.text,
+        timestamp: Date.now(),
+        citations: response.sourcesUsed.map((s) => ({
+          index: s.index,
+          sourceId: s.id,
+          sourceTitle: s.title,
+        })),
+        isFallback: response.isFallback,
+      };
+
+      setMessages((prev) => [...prev, assistantMsg]);
+    } catch (e) {
+      console.error('Failed to get chat response:', e);
+    } finally {
+      setIsChatLoading(false);
+    }
   };
 
-  const handleDeleteWeave = (weaveId: string) => {
-    pushHistory({
-      ...data,
-      weaves: data.weaves.filter((w) => w.id !== weaveId),
-      updatedAt: Date.now(),
-    });
+  const handleRegenerateMessage = (msgId: string) => {
+    const idx = messages.findIndex((m) => m.id === msgId);
+    if (idx > 0) {
+      const prevUserMsg = messages[idx - 1];
+      if (prevUserMsg && prevUserMsg.role === 'user') {
+        handleSendMessage(prevUserMsg.content);
+      }
+    }
   };
 
-  const handleUpdateWeaveLabel = (weaveId: string, label: string) => {
-    setData((prev) => ({
-      ...prev,
-      weaves: prev.weaves.map((w) => (w.id === weaveId ? { ...w, label } : w)),
-    }));
+  const handleSaveMessageToStudio = (msg: ChatMessage) => {
+    if (!activeNotebook) return;
+    const newItem: StudioSavedItem = {
+      id: `saved_${Date.now()}`,
+      notebookId: activeNotebook.id,
+      toolType: 'saved-responses',
+      title: `Response: ${msg.content.slice(0, 45)}...`,
+      data: { content: msg.content, citations: msg.citations },
+      createdAt: Date.now(),
+      tags: ['Saved Chat'],
+    };
+    setSavedItems((prev) => [newItem, ...prev]);
   };
 
-  const handleUpdateNode = (updatedNode: ThoughtNode) => {
-    pushHistory({
-      ...data,
-      nodes: {
-        ...data.nodes,
-        [updatedNode.id]: updatedNode,
-      },
-      updatedAt: Date.now(),
-    });
+  // Studio Saved Items
+  const handleSaveStudioItem = (item: Omit<StudioSavedItem, 'id' | 'createdAt'>) => {
+    const saved: StudioSavedItem = {
+      ...item,
+      id: `saved_${Date.now()}`,
+      createdAt: Date.now(),
+    };
+    setSavedItems((prev) => [saved, ...prev]);
   };
 
-  const selectedNode = selectedNodeId ? data.nodes[selectedNodeId] || null : null;
+  const handleDeleteStudioItem = (id: string) => {
+    setSavedItems((prev) => prev.filter((i) => i.id !== id));
+  };
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-slate-50 font-sans">
-      {/* Top Application Bar */}
-      <Toolbar
-        title={data.title}
-        zoom={viewport.zoom}
-        mode={mode}
-        canUndo={historyPast.length > 0}
-        canRedo={historyFuture.length > 0}
-        searchQuery={searchQuery}
-        searchResultsCount={searchResultsCount}
-        hasSelectedNode={Boolean(selectedNodeId)}
-        onUpdateTitle={(title) => setData((prev) => ({ ...prev, title }))}
-        onAddNode={() => {
-          if (selectedNodeId) {
-            handleAddChild(selectedNodeId);
-          } else {
-            handleAddChild(data.rootId);
-          }
-        }}
-        onStartWeave={() => {
-          if (selectedNodeId) {
-            // Handled via canvas weave mode
-          }
-        }}
-        onAutoLayout={handleAutoLayout}
-        onResetView={handleResetView}
-        onFitView={handleFitView}
-        onZoomIn={() =>
-          setViewport((prev) => ({ ...prev, zoom: Math.min(prev.zoom * 1.2, 2.5) }))
-        }
-        onZoomOut={() =>
-          setViewport((prev) => ({ ...prev, zoom: Math.max(prev.zoom / 1.2, 0.2) }))
-        }
-        onZoomReset={() => setViewport((prev) => ({ ...prev, zoom: 1 }))}
-        onUndo={handleUndo}
-        onRedo={handleRedo}
-        onSearchChange={setSearchQuery}
-        onOpenTemplates={() => setIsTemplatesOpen(true)}
-        onOpenExport={() => setIsExportOpen(true)}
+    <div className="flex h-screen w-screen overflow-hidden bg-white dark:bg-slate-950 font-sans text-slate-900 dark:text-slate-100 antialiased selection:bg-indigo-500/20 selection:text-indigo-600">
+      {/* 1. Desktop Sidebar */}
+      <Sidebar
+        user={currentUser}
+        notebooks={notebooks}
+        activeNotebookId={activeNotebookId}
+        onSelectNotebook={(id) => setActiveNotebookId(id)}
+        onOpenNewNotebook={() => setIsNewNotebookOpen(true)}
+        onOpenSearch={() => setIsSearchOpen(true)}
+        onOpenProfile={() => setIsProfileOpen(true)}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        currentFilter={filterMode}
+        onSetFilter={(f) => setFilterMode(f)}
       />
 
-      {/* Interactive Mind Map Canvas */}
-      <Canvas
-        nodes={data.nodes}
-        weaves={data.weaves}
-        rootId={data.rootId}
-        viewport={viewport}
-        mode={mode}
-        selectedNodeId={selectedNodeId}
-        searchQuery={searchQuery}
-        onViewportChange={setViewport}
-        onSelectNode={(id) => {
-          setSelectedNodeId(id);
-          if (id) {
-            setIsDrawerOpen(true);
-          }
-        }}
-        onInspectNode={(id) => {
-          setSelectedNodeId(id);
-          setIsDrawerOpen(true);
-        }}
-        onUpdateNodeTitle={handleUpdateNodeTitle}
-        onToggleCollapse={handleToggleCollapse}
-        onAddChild={handleAddChild}
-        onAddSibling={handleAddSibling}
-        onDeleteNode={handleDeleteNode}
-        onMoveNode={handleMoveNode}
-        onCreateWeave={handleCreateWeave}
-        onDeleteWeave={handleDeleteWeave}
-      />
-
-      {/* Minimap Radar */}
-      <Minimap
-        nodes={data.nodes}
-        viewport={viewport}
-        onPanTo={(worldX, worldY) => {
-          setViewport((prev) => ({
-            ...prev,
-            x: window.innerWidth / 2 - worldX * prev.zoom,
-            y: window.innerHeight / 2 - worldY * prev.zoom,
-          }));
-        }}
-      />
-
-      {/* Selected Node Details Drawer */}
-      {isDrawerOpen && selectedNode && (
-        <NodeDrawer
-          node={selectedNode}
-          allNodes={data.nodes}
-          weaves={data.weaves}
-          isRoot={selectedNode.id === data.rootId}
-          onClose={() => setIsDrawerOpen(false)}
-          onUpdateNode={handleUpdateNode}
-          onDeleteNode={handleDeleteNode}
-          onAddChild={handleAddChild}
-          onStartWeave={(id) => {
-            // Trigger weave connecting
-          }}
-          onDeleteWeave={handleDeleteWeave}
-          onUpdateWeaveLabel={handleUpdateWeaveLabel}
+      {/* 2. Main Work Area */}
+      <div className="flex-1 flex flex-col h-full min-w-0 relative">
+        {/* Mobile Header and Drawer */}
+        <MobileNav
+          user={currentUser}
+          notebooks={notebooks}
+          activeNotebook={activeNotebook}
+          onSelectNotebook={(id) => setActiveNotebookId(id)}
+          onOpenNewNotebook={() => setIsNewNotebookOpen(true)}
+          onOpenSearch={() => setIsSearchOpen(true)}
+          onOpenProfile={() => setIsProfileOpen(true)}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          activeTab={activeWorkspaceTab}
+          onSelectTab={(tab) => setActiveWorkspaceTab(tab)}
+          sourcesCount={notebookSources.length}
         />
-      )}
 
-      {/* Bottom Shortcuts Floating Pill */}
-      <div className="absolute bottom-4 left-4 z-20 flex items-center gap-2">
-        <button
-          onClick={() => setShowShortcutsHelp(!showShortcutsHelp)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-white/90 backdrop-blur-md rounded-xl border border-slate-200 shadow-sm text-xs font-medium text-slate-600 hover:text-slate-900 transition-colors"
-        >
-          <HelpCircle className="w-3.5 h-3.5 text-indigo-600" />
-          <span className="hidden sm:inline">Shortcuts</span>
-        </button>
+        {/* Dynamic View: Home Dashboard OR Active Notebook Workspace */}
+        {!activeNotebook ? (
+          <HomeScreen
+            user={currentUser}
+            notebooks={notebooks}
+            sources={sources}
+            onSelectNotebook={(id) => setActiveNotebookId(id)}
+            onOpenNewNotebook={() => setIsNewNotebookOpen(true)}
+            onOpenAddSource={(nbId) => {
+              if (nbId) setActiveNotebookId(nbId);
+              setIsAddSourceOpen(true);
+            }}
+            onToggleFavorite={handleToggleFavorite}
+            onArchiveNotebook={handleArchiveNotebook}
+            onDeletePermanently={handleDeletePermanently}
+            filter={filterMode}
+            onSetFilter={(f) => setFilterMode(f)}
+            onOpenSearch={() => setIsSearchOpen(true)}
+          />
+        ) : (
+          <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden">
+            {/* Notebook Top Workspace Header */}
+            <NotebookHeader
+              notebook={activeNotebook}
+              sources={notebookSources}
+              onBackToHome={() => setActiveNotebookId(null)}
+              onUpdateNotebook={handleUpdateNotebook}
+              onOpenAddSource={() => setIsAddSourceOpen(true)}
+              onOpenExport={() => setIsExportOpen(true)}
+              onOpenSearch={() => setIsSearchOpen(true)}
+              geminiConfigured={geminiConfigured}
+            />
 
-        {showShortcutsHelp && (
-          <div className="bg-white/95 backdrop-blur-md rounded-xl border border-slate-200 shadow-lg px-3 py-2 text-[11px] text-slate-600 flex items-center gap-3 animate-in fade-in slide-in-from-bottom-2">
-            <span>
-              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-300 rounded font-semibold text-slate-800">
-                Tab
-              </kbd>{' '}
-              Add child
-            </span>
-            <span>
-              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-300 rounded font-semibold text-slate-800">
-                Enter
-              </kbd>{' '}
-              Add sibling
-            </span>
-            <span>
-              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-300 rounded font-semibold text-slate-800">
-                Del
-              </kbd>{' '}
-              Remove
-            </span>
-            <span>
-              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-300 rounded font-semibold text-slate-800">
-                Drag
-              </kbd>{' '}
-              Move & Pan
-            </span>
+            {/* 3-Column Desktop Workspace & Responsive Mobile Tabs */}
+            <div className="flex-1 flex h-full min-h-0 overflow-hidden pb-12 md:pb-0">
+              {/* Left Column: Sources & Literature */}
+              <div
+                className={`h-full md:block ${
+                  activeWorkspaceTab === 'sources' ? 'block w-full' : 'hidden'
+                }`}
+              >
+                <SourcesPanel
+                  sources={notebookSources}
+                  onToggleSelect={handleToggleSourceSelect}
+                  onToggleSelectAll={handleToggleSelectAll}
+                  onOpenAddSource={() => setIsAddSourceOpen(true)}
+                  onPreviewSource={(src) => setPreviewingSource(src)}
+                  onDeleteSource={handleDeleteSource}
+                  onRenameSource={handleRenameSource}
+                />
+              </div>
+
+              {/* Center Column: Grounded AI Chat Workspace */}
+              <div
+                className={`flex-1 h-full min-w-0 md:block ${
+                  activeWorkspaceTab === 'chat' ? 'block w-full' : 'hidden'
+                }`}
+              >
+                <ChatWorkspace
+                  messages={notebookMessages}
+                  sources={notebookSources}
+                  notebookTitle={activeNotebook.title}
+                  onSendMessage={handleSendMessage}
+                  onRegenerate={handleRegenerateMessage}
+                  onSaveMessageToStudio={handleSaveMessageToStudio}
+                  onPreviewSourceById={(sourceId) => {
+                    const found = notebookSources.find((s) => s.id === sourceId);
+                    if (found) setPreviewingSource(found);
+                  }}
+                  onOpenAddSource={() => setIsAddSourceOpen(true)}
+                  isLoading={isChatLoading}
+                />
+              </div>
+
+              {/* Right Column: Generative Studio Artifacts */}
+              <div
+                className={`h-full md:block ${
+                  activeWorkspaceTab === 'studio' ? 'block w-full' : 'hidden'
+                }`}
+              >
+                <StudioPanel
+                  sources={notebookSources}
+                  notebookTitle={activeNotebook.title}
+                  savedItems={notebookSavedItems}
+                  onSaveItem={handleSaveStudioItem}
+                  onDeleteItem={handleDeleteStudioItem}
+                />
+              </div>
+            </div>
           </div>
         )}
       </div>
 
-      {/* Modals */}
-      <TemplatesModal
-        isOpen={isTemplatesOpen}
-        onClose={() => setIsTemplatesOpen(false)}
-        onSelectTemplate={(newTemplate) => {
-          pushHistory(newTemplate);
-          setSelectedNodeId(null);
-          handleResetView();
-        }}
-      />
+      {/* Global Modals */}
+      {isAddSourceOpen && activeNotebook && (
+        <AddSourceModal
+          isOpen={isAddSourceOpen}
+          notebookId={activeNotebook.id}
+          onClose={() => setIsAddSourceOpen(false)}
+          onAddSource={handleAddSource}
+        />
+      )}
 
-      <ExportModal
-        isOpen={isExportOpen}
-        data={data}
-        onClose={() => setIsExportOpen(false)}
-        onImportData={(importedData) => {
-          pushHistory(importedData);
-          setSelectedNodeId(null);
-          handleResetView();
-        }}
-      />
+      {previewingSource && (
+        <SourceReaderModal
+          source={previewingSource}
+          onClose={() => setPreviewingSource(null)}
+          onToggleSelect={handleToggleSourceSelect}
+        />
+      )}
+
+      {isSearchOpen && (
+        <GlobalSearchModal
+          isOpen={isSearchOpen}
+          onClose={() => setIsSearchOpen(false)}
+          notebooks={notebooks}
+          sources={sources}
+          messages={messages}
+          savedItems={savedItems}
+          onSelectNotebook={(id) => {
+            setActiveNotebookId(id);
+            setIsSearchOpen(false);
+          }}
+          onPreviewSource={(src) => {
+            setActiveNotebookId(src.notebookId);
+            setPreviewingSource(src);
+            setIsSearchOpen(false);
+          }}
+        />
+      )}
+
+      {isProfileOpen && (
+        <UserProfileModal
+          isOpen={isProfileOpen}
+          currentUser={currentUser}
+          onClose={() => setIsProfileOpen(false)}
+          onSwitchUser={handleSwitchUser}
+          onClearUserData={handleClearUserData}
+        />
+      )}
+
+      {isNewNotebookOpen && (
+        <NewNotebookModal
+          isOpen={isNewNotebookOpen}
+          userId={currentUser.id}
+          onClose={() => setIsNewNotebookOpen(false)}
+          onCreateNotebook={handleCreateNotebook}
+        />
+      )}
+
+      {isExportOpen && activeNotebook && (
+        <ShareExportModal
+          isOpen={isExportOpen}
+          notebook={activeNotebook}
+          sources={notebookSources}
+          messages={notebookMessages}
+          savedItems={notebookSavedItems}
+          onClose={() => setIsExportOpen(false)}
+        />
+      )}
     </div>
   );
 };
