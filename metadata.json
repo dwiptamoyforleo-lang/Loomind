@@ -1,0 +1,6 @@
+{
+  "name": "Loomind",
+  "description": "Visual thought weaving and mind mapping canvas for organizing ideas, notes, and connections.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
